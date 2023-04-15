@@ -15,10 +15,6 @@ type NodeInfo struct {
 	Addr NodeAddr
 }
 
-func (me NodeInfo) ToNodeInfoAddrPort() NodeInfoAddrPort {
-	return NodeInfoAddrPort{me.ID, me.Addr.ToNodeAddrPort()}
-}
-
 func (me NodeInfo) String() string {
 	return fmt.Sprintf("{%x at %s}", me.ID, me.Addr)
 }

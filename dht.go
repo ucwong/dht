@@ -9,16 +9,14 @@ import (
 	"net"
 	"time"
 
+	"github.com/anacrolix/dht/v2/bep44"
+	"github.com/anacrolix/dht/v2/krpc"
+	peer_store "github.com/anacrolix/dht/v2/peer-store"
 	"github.com/anacrolix/log"
 	"github.com/anacrolix/missinggo/v2"
 	"github.com/anacrolix/torrent/iplist"
 	"github.com/anacrolix/torrent/metainfo"
 	"golang.org/x/time/rate"
-
-	"github.com/anacrolix/dht/v2/bep44"
-	"github.com/anacrolix/dht/v2/krpc"
-	peer_store "github.com/anacrolix/dht/v2/peer-store"
-	"github.com/anacrolix/dht/v2/transactions"
 )
 
 func defaultQueryResendDelay() time.Duration {
@@ -26,7 +24,11 @@ func defaultQueryResendDelay() time.Duration {
 	return 2 * time.Second
 }
 
-type transactionKey = transactions.Key
+// Uniquely identifies a transaction to us.
+type transactionKey struct {
+	RemoteAddr string // host:port
+	T          string // The KRPC transaction ID.
+}
 
 type StartingNodesGetter func() ([]Addr, error)
 
@@ -42,10 +44,6 @@ type ServerConfig struct {
 	// Whether to wait for rate limiting to allow us to reply.
 	WaitToReply bool
 
-	// Called when there are no good nodes to use in the routing table. This might be called any
-	// time when there are no nodes, including during bootstrap if one is performed. Typically it
-	// returns the resolve addresses of bootstrap or "router" nodes that are designed to kick-start
-	// a routing table.
 	StartingNodes StartingNodesGetter
 	// Disable the DHT security extension: http://www.libtorrent.org/dht_sec.html.
 	NoSecurity bool
@@ -60,8 +58,8 @@ type ServerConfig struct {
 	OnQuery func(query *krpc.Msg, source net.Addr) (propagate bool)
 	// Called when a peer successfully announces to us.
 	OnAnnouncePeer func(infoHash metainfo.Hash, ip net.IP, port int, portOk bool)
-	// How long to wait before resending queries that haven't received a response. Defaults to 2s.
-	// After the last send, a query is aborted after this time.
+	// How long to wait before resending queries that haven't received a response. Defaults to a
+	// random value between 4.5 and 5.5s.
 	QueryResendDelay func() time.Duration
 	// TODO: Expose Peers, to return NodeInfo for received get_peers queries.
 	PeerStore peer_store.Interface
@@ -114,17 +112,9 @@ var DefaultGlobalBootstrapHostPorts = []string{
 	"router.bittorrent.cloud:42069",
 }
 
-// Returns the resolved addresses of the default global bootstrap nodes. Network is unused but was
-// historically passed by anacrolix/torrent.
-func GlobalBootstrapAddrs(network string) ([]Addr, error) {
-	return ResolveHostPorts(DefaultGlobalBootstrapHostPorts)
-}
-
-// Resolves host:port strings to dht.Addrs, using the dht DNS resolver cache. Suitable for use with
-// ServerConfig.BootstrapAddrs.
-func ResolveHostPorts(hostPorts []string) (addrs []Addr, err error) {
+func GlobalBootstrapAddrs(network string) (addrs []Addr, err error) {
 	initDnsResolver()
-	for _, s := range hostPorts {
+	for _, s := range DefaultGlobalBootstrapHostPorts {
 		host, port, err := net.SplitHostPort(s)
 		if err != nil {
 			panic(err)

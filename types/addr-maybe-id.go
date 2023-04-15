@@ -2,8 +2,8 @@ package types
 
 import (
 	"fmt"
+	"hash/fnv"
 
-	"github.com/anacrolix/generics"
 	"github.com/anacrolix/multiless"
 
 	"github.com/anacrolix/dht/v2/int160"
@@ -15,52 +15,58 @@ func AddrMaybeIdSliceFromNodeInfoSlice(nis []krpc.NodeInfo) (ret []AddrMaybeId) 
 	for _, ni := range nis {
 		id := int160.FromByteArray(ni.ID)
 		ret = append(ret, AddrMaybeId{
-			Addr: ni.Addr.ToNodeAddrPort(),
-			Id:   generics.Some(id),
+			Addr: ni.Addr,
+			Id:   &id,
 		})
 	}
 	return
 }
 
 type AddrMaybeId struct {
-	Addr krpc.NodeAddrPort
-	Id   generics.Option[int160.T]
+	Addr krpc.NodeAddr
+	Id   *int160.T
 }
 
-func (me AddrMaybeId) TryIntoNodeInfo() (ret *krpc.NodeInfo) {
-	if !me.Id.Ok {
+func (me AddrMaybeId) TryIntoNodeInfo() *krpc.NodeInfo {
+	if me.Id == nil {
 		return nil
 	}
 	return &krpc.NodeInfo{
-		ID:   me.Id.Value.AsByteArray(),
-		Addr: me.Addr.ToNodeAddr(),
+		ID:   me.Id.AsByteArray(),
+		Addr: me.Addr,
 	}
 }
 
 func (me *AddrMaybeId) FromNodeInfo(ni krpc.NodeInfo) {
 	id := int160.FromByteArray(ni.ID)
 	*me = AddrMaybeId{
-		Addr: ni.Addr.ToNodeAddrPort(),
-		Id:   generics.Some(id),
+		Addr: ni.Addr,
+		Id:   &id,
 	}
 }
 
 func (me AddrMaybeId) String() string {
-	if !me.Id.Ok {
+	if me.Id == nil {
 		return fmt.Sprintf("unknown id at %s", me.Addr)
 	} else {
-		return fmt.Sprintf("%v at %v", me.Id.Value, me.Addr)
+		return fmt.Sprintf("%v at %v", *me.Id, me.Addr)
 	}
 }
 
 func (l AddrMaybeId) CloserThan(r AddrMaybeId, target int160.T) bool {
-	ml := multiless.New().Bool(!l.Id.Ok, !r.Id.Ok)
-	if l.Id.Ok && r.Id.Ok {
-		ml = ml.Cmp(l.Id.Value.Distance(target).Cmp(r.Id.Value.Distance(target)))
+	ml := multiless.New().Bool(l.Id == nil, r.Id == nil)
+	if l.Id != nil && r.Id != nil {
+		ml = ml.Cmp(l.Id.Distance(target).Cmp(r.Id.Distance(target)))
 	}
 	if !ml.Ok() {
-		ml = ml.Cmp(l.Addr.Addr().Compare(r.Addr.Addr()))
-		ml = multiless.EagerOrdered(ml, l.Addr.Port(), r.Addr.Port())
+		// We could use maphash, but it wasn't much faster, and requires a seed. A seed would allow
+		// us to prevent deterministic handling of addrs for different uses.
+		hashString := func(s string) uint64 {
+			h := fnv.New64a()
+			h.Write([]byte(s))
+			return h.Sum64()
+		}
+		ml = ml.Uint64(hashString(l.Addr.String()), hashString(r.Addr.String()))
 	}
 	return ml.Less()
 }

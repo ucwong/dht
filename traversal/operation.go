@@ -4,11 +4,12 @@ import (
 	"context"
 	"sync/atomic"
 
-	"github.com/anacrolix/chansync"
 	"github.com/anacrolix/chansync/events"
+	"github.com/anacrolix/dht/v2/containers"
 	"github.com/anacrolix/sync"
 
-	"github.com/anacrolix/dht/v2/containers"
+	"github.com/anacrolix/chansync"
+
 	"github.com/anacrolix/dht/v2/int160"
 	k_nearest_nodes "github.com/anacrolix/dht/v2/k-nearest-nodes"
 	"github.com/anacrolix/dht/v2/krpc"
@@ -16,8 +17,7 @@ import (
 )
 
 type QueryResult struct {
-	// This is set non-nil if a query reply is a response-type as defined by the DHT BEP 5 (contains
-	// "r")
+	// A node that should be considered for a closest entry.
 	ResponseFrom *krpc.NodeInfo
 	// Data associated with a closest node. Is this ever not a string? I think using generics for
 	// this leaks throughout the entire Operation. Hardly worth it. It's still possible to handle
@@ -33,11 +33,6 @@ type OperationInput struct {
 	K          int
 	DoQuery    func(context.Context, krpc.NodeAddr) QueryResult
 	NodeFilter func(types.AddrMaybeId) bool
-	// This filters the adding of nodes to the "closest data" set based on the data they provided.
-	// The data is (usually?) derived from the token field in a reply. For the get_peers traversal
-	// operation for example, we would filter out non-strings, since we later need to pass strings
-	// in to the Token field to announce ourselves to the closest nodes we found to the target.
-	DataFilter func(data any) bool
 }
 
 type defaultsAppliedOperationInput OperationInput
@@ -52,11 +47,6 @@ func Start(input OperationInput) *Operation {
 	}
 	if herp.NodeFilter == nil {
 		herp.NodeFilter = func(types.AddrMaybeId) bool {
-			return true
-		}
-	}
-	if herp.DataFilter == nil {
-		herp.DataFilter = func(_ any) bool {
 			return true
 		}
 	}
@@ -138,7 +128,7 @@ func (op *Operation) AddNodes(nodes []types.AddrMaybeId) (added int) {
 	return op.unqueried.Len() - before
 }
 
-func (op *Operation) markQueried(addr krpc.NodeAddrPort) {
+func (op *Operation) markQueried(addr krpc.NodeAddr) {
 	op.queried[addrString(addr.String())] = struct{}{}
 }
 
@@ -160,12 +150,10 @@ func (op *Operation) haveQuery() bool {
 		return true
 	}
 	cu := op.closestUnqueried()
-	if !cu.Id.Ok {
+	if cu.Id == nil {
 		return false
 	}
-	cuDist := cu.Id.Value.Distance(op.targetInt160)
-	farDist := op.closest.Farthest().ID.Int160().Distance(op.targetInt160)
-	return cuDist.Cmp(farDist) <= 0
+	return cu.Id.Distance(op.targetInt160).Cmp(op.closest.Farthest().ID.Int160().Distance(op.targetInt160)) <= 0
 }
 
 func (op *Operation) run() {
@@ -200,11 +188,8 @@ func (op *Operation) addClosest(node krpc.NodeInfo, data interface{}) {
 	if !op.input.NodeFilter(ami) {
 		return
 	}
-	if !op.input.DataFilter(data) {
-		return
-	}
 	op.closest = op.closest.Push(k_nearest_nodes.Elem{
-		Key:  node.ToNodeInfoAddrPort(),
+		Key:  node,
 		Data: data,
 	})
 }
@@ -234,7 +219,7 @@ func (op *Operation) startQuery() {
 				cancel()
 			}
 		}()
-		res := op.input.DoQuery(ctx, a.Addr.ToNodeAddr())
+		res := op.input.DoQuery(ctx, a.Addr)
 		cancel()
 		if res.ResponseFrom != nil {
 			func() {

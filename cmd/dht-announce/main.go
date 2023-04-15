@@ -7,10 +7,11 @@ import (
 	"os/signal"
 	"sync"
 
-	_ "github.com/anacrolix/envpprof"
 	"github.com/anacrolix/log"
-	"github.com/anacrolix/tagflag"
 	"github.com/davecgh/go-spew/spew"
+
+	_ "github.com/anacrolix/envpprof"
+	"github.com/anacrolix/tagflag"
 
 	"github.com/anacrolix/dht/v2"
 )

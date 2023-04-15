@@ -10,7 +10,7 @@ import (
 	"github.com/anacrolix/dht/v2/krpc"
 )
 
-type Key = krpc.NodeInfoAddrPort
+type Key = krpc.NodeInfo
 
 type Elem struct {
 	Key
@@ -18,7 +18,7 @@ type Elem struct {
 }
 
 type Type struct {
-	inner *immutable.SortedMap[Key, any]
+	inner *immutable.SortedMap
 	k     int
 }
 
@@ -26,7 +26,9 @@ func New(target int160.T, k int) Type {
 	seed := maphash.MakeSeed()
 	return Type{
 		k: k,
-		inner: immutable.NewSortedMap[Key, any](lessComparer[Key]{less: func(l, r Key) bool {
+		inner: immutable.NewSortedMap(lessComparer{less: func(_l, _r interface{}) bool {
+			l := _l.(Key)
+			r := _r.(Key)
 			return multiless.New().Cmp(
 				l.ID.Int160().Distance(target).Cmp(r.ID.Int160().Distance(target)),
 			).Lazy(func() multiless.Computation {
@@ -43,13 +45,10 @@ func New(target int160.T, k int) Type {
 
 func (me *Type) Range(f func(Elem)) {
 	iter := me.inner.Iterator()
-	for {
-		key, value, ok := iter.Next()
-		if !ok {
-			break
-		}
+	for !iter.Done() {
+		key, value := iter.Next()
 		f(Elem{
-			Key:  key,
+			Key:  key.(Key),
 			Data: value,
 		})
 	}
@@ -64,7 +63,7 @@ func (me Type) Push(elem Elem) Type {
 	for me.inner.Len() > me.k {
 		iter := me.inner.Iterator()
 		iter.Last()
-		key, _, _ := iter.Next()
+		key, _ := iter.Next()
 		me.inner = me.inner.Delete(key)
 	}
 	return me
@@ -73,12 +72,12 @@ func (me Type) Push(elem Elem) Type {
 func (me Type) Farthest() (elem Elem) {
 	iter := me.inner.Iterator()
 	iter.Last()
-	key, value, ok := iter.Next()
-	if !ok {
+	if iter.Done() {
 		panic(me.k)
 	}
+	key, value := iter.Next()
 	return Elem{
-		Key:  key,
+		Key:  key.(Key),
 		Data: value,
 	}
 }
@@ -87,13 +86,13 @@ func (me Type) Full() bool {
 	return me.Len() >= me.k
 }
 
-type lessFunc[K any] func(l, r K) bool
+type lessFunc func(l, r interface{}) bool
 
-type lessComparer[K any] struct {
-	less lessFunc[K]
+type lessComparer struct {
+	less lessFunc
 }
 
-func (me lessComparer[K]) Compare(i, j K) int {
+func (me lessComparer) Compare(i, j interface{}) int {
 	if me.less(i, j) {
 		return -1
 	} else if me.less(j, i) {
