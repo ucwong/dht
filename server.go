@@ -3,7 +3,6 @@ package dht
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,21 +12,21 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/anacrolix/generics"
 	"github.com/anacrolix/log"
 	"github.com/anacrolix/missinggo/v2"
 	"github.com/anacrolix/sync"
-	"golang.org/x/time/rate"
-
+	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/iplist"
 	"github.com/anacrolix/torrent/logonce"
 	"github.com/anacrolix/torrent/metainfo"
-
-	"github.com/anacrolix/torrent/bencode"
+	"golang.org/x/time/rate"
 
 	"github.com/anacrolix/dht/v2/bep44"
 	"github.com/anacrolix/dht/v2/int160"
 	"github.com/anacrolix/dht/v2/krpc"
 	peer_store "github.com/anacrolix/dht/v2/peer-store"
+	"github.com/anacrolix/dht/v2/transactions"
 	"github.com/anacrolix/dht/v2/traversal"
 	"github.com/anacrolix/dht/v2/types"
 )
@@ -45,7 +44,7 @@ type Server struct {
 	resendDelay func() time.Duration
 
 	mu           sync.RWMutex
-	transactions map[transactionKey]*Transaction
+	transactions transactions.Dispatcher[*transaction]
 	nextT        uint64 // unique "t" field for outbound queries
 	table        table
 	closed       missinggo.Event
@@ -86,7 +85,7 @@ func (s *Server) WriteStatus(w io.Writer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fmt.Fprintf(w, "Nodes in table: %d good, %d total\n", s.numGoodNodes(), s.numNodes())
-	fmt.Fprintf(w, "Ongoing transactions: %d\n", len(s.transactions))
+	fmt.Fprintf(w, "Ongoing transactions: %d\n", s.transactions.NumActive())
 	fmt.Fprintf(w, "Server node ID: %x\n", s.id.Bytes())
 	for i, b := range s.table.buckets {
 		if b.Len() == 0 && b.lastChanged.IsZero() {
@@ -144,7 +143,7 @@ func (s *Server) Stats() ServerStats {
 	ss := s.stats
 	ss.GoodNodes = s.numGoodNodes()
 	ss.Nodes = s.numNodes()
-	ss.OutstandingTransactions = len(s.transactions)
+	ss.OutstandingTransactions = s.transactions.NumActive()
 	return ss
 }
 
@@ -227,7 +226,6 @@ func NewServer(c *ServerConfig) (s *Server, err error) {
 			interval:         5 * time.Minute,
 			secret:           make([]byte, 20),
 		},
-		transactions: make(map[transactionKey]*Transaction),
 		table: table{
 			k: 8,
 		},
@@ -294,7 +292,7 @@ func (s *Server) processPacket(b []byte, addr Addr) {
 				if int(se.Offset) == len(b) {
 					return
 				}
-				// Some messages seem to drop to nul chars abrubtly.
+				// Some messages seem to drop to nul chars abruptly.
 				if int(se.Offset) < len(b) && b[se.Offset] == 0 {
 					return
 				}
@@ -324,11 +322,11 @@ func (s *Server) processPacket(b []byte, addr Addr) {
 		RemoteAddr: addr.String(),
 		T:          d.T,
 	}
-	t, ok := s.transactions[tk]
-	if !ok {
+	if !s.transactions.Have(tk) {
 		s.logger().Printf("received response for untracked transaction %q from %v", d.T, addr)
 		return
 	}
+	t := s.transactions.Pop(tk)
 	// s.logger().Printf("received response for transaction %q from %v", d.T, addr)
 	go t.handleResponse(d)
 	s.updateNode(addr, d.SenderID(), !d.ReadOnly, func(n *node) {
@@ -336,8 +334,6 @@ func (s *Server) processPacket(b []byte, addr Addr) {
 		n.failedLastQuestionablePing = false
 		n.numReceivesFrom++
 	})
-	// Ensure we don't provide more than one response to a transaction.
-	s.deleteTransaction(tk)
 }
 
 func (s *Server) serve() error {
@@ -830,21 +826,17 @@ func (s *Server) writeToNode(ctx context.Context, b []byte, node Addr, wait, rat
 }
 
 func (s *Server) nextTransactionID() string {
-	var b [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(b[:], s.nextT)
-	s.nextT++
-	return string(b[:n])
+	return transactions.DefaultIdIssuer.Issue()
 }
 
 func (s *Server) deleteTransaction(k transactionKey) {
-	delete(s.transactions, k)
+	if s.transactions.Have(k) {
+		s.transactions.Pop(k)
+	}
 }
 
-func (s *Server) addTransaction(k transactionKey, t *Transaction) {
-	if _, ok := s.transactions[k]; ok {
-		panic("transaction not unique")
-	}
-	s.transactions[k] = t
+func (s *Server) addTransaction(k transactionKey, t *transaction) {
+	s.transactions.Add(k, t)
 }
 
 // ID returns the 20-byte server ID. This is the ID used to communicate with the
@@ -952,7 +944,7 @@ func (s *Server) Query(ctx context.Context, addr Addr, q string, input QueryInpu
 			q, time.Since(started), ret.Err, ret.Reply.Y, ret.Reply.E, ret.Writes)
 	}(time.Now())
 	replyChan := make(chan krpc.Msg, 1)
-	t := &Transaction{
+	t := &transaction{
 		onResponse: func(m krpc.Msg) {
 			replyChan <- m
 		},
@@ -1242,7 +1234,9 @@ func (s *Server) closestNodes(k int, target int160.T, filter func(*node) bool) [
 func (s *Server) TraversalStartingNodes() (nodes []addrMaybeId, err error) {
 	s.mu.RLock()
 	s.table.forNodes(func(n *node) bool {
-		nodes = append(nodes, addrMaybeId{Addr: n.Addr.KRPC(), Id: &n.Id})
+		nodes = append(nodes, addrMaybeId{
+			Addr: n.Addr.KRPC().ToNodeAddrPort(),
+			Id:   generics.Some(n.Id)})
 		return true
 	})
 	s.mu.RUnlock()
@@ -1262,7 +1256,7 @@ func (s *Server) TraversalStartingNodes() (nodes []addrMaybeId, err error) {
 			// log.Printf("resolved %v addresses", len(addrs))
 		}
 		for _, a := range addrs {
-			nodes = append(nodes, addrMaybeId{Addr: a.KRPC(), Id: nil})
+			nodes = append(nodes, addrMaybeId{Addr: a.KRPC().ToNodeAddrPort()})
 		}
 	}
 	if len(nodes) == 0 {
@@ -1373,7 +1367,7 @@ func (s *Server) pingQuestionableNodesInBucket(bucketIndex int) {
 				defer wg.Done()
 				err := s.questionableNodePing(context.TODO(), n.Addr, n.Id.AsByteArray()).Err
 				if err != nil {
-					log.Printf("error pinging questionable node in bucket %v: %v", bucketIndex, err)
+					s.logger().WithDefaultLevel(log.Debug).Printf("error pinging questionable node in bucket %v: %v", bucketIndex, err)
 				}
 			}()
 		}
@@ -1389,13 +1383,14 @@ func (s *Server) pingQuestionableNodesInBucket(bucketIndex int) {
 // having set it up. It is not necessary to explicitly Bootstrap the Server once this routine has
 // started.
 func (s *Server) TableMaintainer() {
+	logger := s.logger()
 	for {
 		if s.shouldBootstrapUnlocked() {
 			stats, err := s.Bootstrap()
 			if err != nil {
-				log.Printf("error bootstrapping during bucket refresh: %v", err)
+				logger.Levelf(log.Error, "error bootstrapping during bucket refresh: %v", err)
 			}
-			log.Printf("bucket refresh bootstrap stats: %v", stats)
+			logger.Levelf(log.Debug, "bucket refresh bootstrap stats: %v", stats)
 		}
 		s.mu.RLock()
 		for i := range s.table.buckets {
@@ -1406,10 +1401,10 @@ func (s *Server) TableMaintainer() {
 			if s.shouldStopRefreshingBucket(i) {
 				continue
 			}
-			s.logger().Levelf(log.Info, "refreshing bucket %v", i)
+			logger.Levelf(log.Debug, "refreshing bucket %v", i)
 			s.mu.RUnlock()
 			stats := s.refreshBucket(i)
-			s.logger().Levelf(log.Info, "finished refreshing bucket %v: %v", i, stats)
+			logger.Levelf(log.Debug, "finished refreshing bucket %v: %v", i, stats)
 			s.mu.RLock()
 			if !s.shouldStopRefreshingBucket(i) {
 				// Presumably we couldn't fill the bucket anymore, so assume we're as deep in the
@@ -1451,13 +1446,13 @@ func (s *Server) TraversalNodeFilter(node addrMaybeId) bool {
 	if !validNodeAddr(node.Addr.UDP()) {
 		return false
 	}
-	if s.ipBlocked(node.Addr.IP) {
+	if s.ipBlocked(node.Addr.IP()) {
 		return false
 	}
-	if node.Id == nil {
+	if !node.Id.Ok {
 		return true
 	}
-	return s.config.NoSecurity || NodeIdSecure(node.Id.AsByteArray(), node.Addr.IP)
+	return s.config.NoSecurity || NodeIdSecure(node.Id.Value.AsByteArray(), node.Addr.IP())
 }
 
 func validNodeAddr(addr net.Addr) bool {

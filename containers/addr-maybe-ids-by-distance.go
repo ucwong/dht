@@ -1,10 +1,11 @@
 package containers
 
 import (
-	"github.com/anacrolix/dht/v2/int160"
-	"github.com/anacrolix/dht/v2/types"
 	"github.com/anacrolix/missinggo/v2/iter"
 	"github.com/anacrolix/stm/stmutil"
+
+	"github.com/anacrolix/dht/v2/int160"
+	"github.com/anacrolix/dht/v2/types"
 )
 
 type addrMaybeId = types.AddrMaybeId
@@ -17,7 +18,7 @@ type AddrMaybeIdsByDistance interface {
 }
 
 type stmSettishWrapper struct {
-	set stmutil.Settish
+	set stmutil.Settish[addrMaybeId]
 }
 
 func (me stmSettishWrapper) Next() addrMaybeId {
@@ -38,7 +39,7 @@ func (me stmSettishWrapper) Add(x addrMaybeId) AddrMaybeIdsByDistance {
 }
 
 func NewImmutableAddrMaybeIdsByDistance(target int160.T) AddrMaybeIdsByDistance {
-	return stmSettishWrapper{stmutil.NewSortedSet(func(l, r interface{}) bool {
-		return l.(addrMaybeId).CloserThan(r.(addrMaybeId), target)
+	return stmSettishWrapper{stmutil.NewSortedSet[addrMaybeId](func(l, r addrMaybeId) bool {
+		return l.CloserThan(r, target)
 	})}
 }

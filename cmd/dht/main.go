@@ -5,19 +5,30 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
-
-	"github.com/anacrolix/args/targets"
-	"github.com/anacrolix/dht/v2/bep44"
-	"github.com/anacrolix/log"
-	"github.com/anacrolix/torrent/bencode"
+	"time"
 
 	"github.com/anacrolix/args"
-	"github.com/anacrolix/dht/v2"
+	"github.com/anacrolix/args/targets"
+	"github.com/anacrolix/log"
 	"github.com/anacrolix/publicip"
-	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/types/infohash"
+	"github.com/davecgh/go-spew/spew"
+
+	"github.com/anacrolix/dht/v2"
+	"github.com/anacrolix/dht/v2/bep44"
+	"github.com/anacrolix/dht/v2/krpc"
 )
+
+type serverParams struct {
+	Network          string
+	Secure           bool
+	BootstrapAddr    []string
+	QueryResendDelay time.Duration
+}
 
 func main() {
 	logger := log.Default.WithNames("main")
@@ -25,8 +36,13 @@ func main() {
 	ctx, stopSignalNotify := signal.NotifyContext(ctx, os.Interrupt)
 	defer stopSignalNotify()
 	var s *dht.Server
+	serverArgs := serverParams{
+		Network: "udp",
+		Secure:  false,
+	}
 	args.Main{
-		Params: []args.Param{
+		Params: append(
+			args.FromStruct(&serverArgs),
 			args.Subcommand("derive-put-target", func(sub args.SubCmdCtx) (err error) {
 				var put bep44.Put
 				if !sub.Parse(
@@ -83,7 +99,7 @@ func main() {
 			}),
 			args.Subcommand("put-mutable-infohash", func(ctx args.SubCmdCtx) (err error) {
 				var putOpt PutMutableInfohash
-				var ih torrent.InfoHash
+				var ih infohash.T
 				ctx.Parse(append(
 					args.FromStruct(&putOpt),
 					args.Opt(args.OptOpt{
@@ -102,6 +118,7 @@ func main() {
 			}),
 			args.Subcommand("ping", func(ctx args.SubCmdCtx) (err error) {
 				var pa pingArgs
+				pa.Network = serverArgs.Network
 				ctx.Parse(args.FromStruct(&pa)...)
 				ctx.Defer(func() error {
 					return ping(pa, s)
@@ -112,7 +129,7 @@ func main() {
 				var subArgs = struct {
 					AnnouncePort int
 					Scrape       bool
-					InfoHash     torrent.InfoHash
+					InfoHash     infohash.T `arity:"+"`
 				}{}
 				sub.Parse(args.FromStruct(&subArgs)...)
 				var announceOpts []dht.AnnounceOpt
@@ -129,14 +146,81 @@ func main() {
 				})
 				return nil
 			}),
-		},
+			args.Subcommand("query", func(sub args.SubCmdCtx) (err error) {
+				var subArgs = struct {
+					Addr   string `arg:"positional"`
+					Q      string `arg:"positional"`
+					Target krpc.ID
+				}{}
+				sub.Parse(args.FromStruct(&subArgs)...)
+				sub.Defer(func() error {
+					addr, err := net.ResolveUDPAddr(serverArgs.Network, subArgs.Addr)
+					if err != nil {
+						return err
+					}
+					input := dht.QueryInput{}
+					input.MsgArgs.Target = subArgs.Target
+					res := s.Query(ctx, dht.NewAddr(addr), subArgs.Q, input)
+					spew.Dump(res)
+					return nil
+				})
+				return nil
+			}),
+			args.Subcommand("ping-nodes", func(sub args.SubCmdCtx) (err error) {
+				var subArgs = struct {
+					Timeout time.Duration
+					Addr    string `arg:"positional"`
+					Q       string `arg:"positional"`
+					Target  krpc.ID
+				}{}
+				sub.Parse(args.FromStruct(&subArgs)...)
+				sub.Defer(func() error {
+					addr, err := net.ResolveUDPAddr(serverArgs.Network, subArgs.Addr)
+					if err != nil {
+						return err
+					}
+					input := dht.QueryInput{}
+					input.MsgArgs.Target = subArgs.Target
+					res := s.Query(ctx, dht.NewAddr(addr), subArgs.Q, input)
+					err = res.ToError()
+					if err != nil {
+						return err
+					}
+					return ping(pingArgs{
+						Network: serverArgs.Network,
+						Nodes: func() (ret []string) {
+							res.Reply.R.ForAllNodes(func(info krpc.NodeInfo) {
+								ret = append(ret, info.Addr.String())
+							})
+							return
+						}(),
+						Timeout: subArgs.Timeout,
+					}, s)
+				})
+				return nil
+			}),
+		),
 		AfterParse: func() (err error) {
 			cfg := dht.NewDefaultServerConfig()
-			all, err := publicip.GetAll(context.TODO())
+			if serverArgs.QueryResendDelay != 0 {
+				cfg.QueryResendDelay = func() time.Duration { return serverArgs.QueryResendDelay }
+			}
+			conn, err := net.ListenPacket(serverArgs.Network, ":0")
+			if err != nil {
+				err = fmt.Errorf("listening: %w", err)
+				return
+			}
+			cfg.Conn = conn
+			all, err := publicip.Get(context.TODO(), serverArgs.Network)
 			if err == nil {
-				cfg.PublicIP = all[0].IP
+				cfg.PublicIP = all[0]
 				log.Printf("public ip: %q", cfg.PublicIP)
-				cfg.NoSecurity = false
+				cfg.NoSecurity = !serverArgs.Secure
+			}
+			if len(serverArgs.BootstrapAddr) != 0 {
+				cfg.StartingNodes = func() ([]dht.Addr, error) {
+					return dht.ResolveHostPorts(serverArgs.BootstrapAddr)
+				}
 			}
 			s, err = dht.NewServer(cfg)
 			if err != nil {
